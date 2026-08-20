@@ -1,0 +1,17 @@
+# Production overrides. Use with:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+# This disables source mounts/reload and adds multiple uvicorn workers.
+
+services:
+  api:
+    command:
+      ["uvicorn", "lsm.main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "4"]
+    environment:
+      LSM_LOG_LEVEL: INFO
+
+  worker:
+    command: ["arq", "lsm.worker.WorkerSettings"]
+    environment:
+      LSM_LOG_LEVEL: INFO
+    deploy:
+      replicas: 2

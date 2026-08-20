@@ -1,0 +1,66 @@
+# Base stack: redis + api + worker. All three share one image and env-file.
+# The API port is published on 127.0.0.1 only (see the `api.ports` entry) so it
+# is never exposed on the LAN; front it with a reverse proxy for remote access.
+# Dev override (default via docker compose) is in docker-compose.override.yml;
+# production settings live in docker-compose.prod.yml:
+#   dev  : docker compose up --build
+#   prod : docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: llm-session-manager:latest
+    env_file: .env
+    environment:
+      LSM_REDIS_URL: redis://redis:6379/0
+    extra_hosts:
+      # Lets the container reach a model server running on the host (e.g. LM Studio).
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      # Bind to loopback only by default so the API is never exposed on the LAN
+      # or leaked through the host firewall. Front it with a reverse proxy for
+      # remote access (see the README). Override LSM_BIND_HOST at your own risk.
+      - "${LSM_BIND_HOST:-127.0.0.1}:${LSM_API_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/v1/health').status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: llm-session-manager:latest
+    command: ["arq", "lsm.worker.WorkerSettings"]
+    env_file: .env
+    environment:
+      LSM_REDIS_URL: redis://redis:6379/0
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  redis-data:
