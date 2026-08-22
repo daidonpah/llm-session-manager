@@ -47,6 +47,13 @@ class Settings(BaseSettings):
     api_port: int = 8080
     log_level: str = "INFO"
 
+    # Model assets (HuggingFace downloads for use with vLLM)
+    # `hf_cache_dir` is the resumable/deduplicated HF cache (HF_HOME/hub);
+    # `models_dir` holds clean, flat, vLLM-ready copies of each downloaded model.
+    assets_dir: str = "assets"
+    hf_cache_dir: str = "assets/hf-cache"
+    models_dir: str = "assets/models"
+
     @property
     def model_base_url_clean(self) -> str:
         """Base URL without a trailing slash."""

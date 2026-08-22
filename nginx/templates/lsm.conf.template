@@ -1,0 +1,115 @@
+# nginx reverse-proxy config for llm-session-manager.
+#
+# Defines TWO name-based virtual hosts, each with its own hostname + cert:
+#   1. ${SM_SERVER_NAME}      -> the session-manager API (${API_UPSTREAM})
+#   2. ${OPENAI_SERVER_NAME}  -> the raw OpenAI-compatible model server
+#                                (${OPENAI_UPSTREAM})
+#
+# Each vhost has its own cert/key variables (SM_TLS_* and OPENAI_TLS_*). In the
+# compose stack these default to the shared TLS_CERT_FILE/TLS_KEY_FILE, so a
+# single SAN/wildcard cert Just Works; set the per-vhost vars only if you want a
+# separate cert per hostname.
+#
+# This file is ALSO a copy-paste template for an existing nginx instance. If you
+# run nginx elsewhere, copy the block(s) you need and replace the ${...}
+# placeholders: the server names, the TLS cert/key paths, and the `upstream`
+# server host:port values.
+#
+# Inside this Docker stack these values are filled in from .env via envsubst.
+
+# --- Upstreams -------------------------------------------------------------
+upstream lsm_api {
+    server ${API_UPSTREAM};
+    keepalive 16;
+}
+
+upstream openai_api {
+    server ${OPENAI_UPSTREAM};
+    keepalive 16;
+}
+
+# Shared proxy settings for SSE-safe streaming (chat completions stream tokens).
+# Reused by both vhosts via `include`-style duplication kept inline for clarity.
+
+# --- Redirect all plaintext traffic to HTTPS (both hostnames) --------------
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${SM_SERVER_NAME} ${OPENAI_SERVER_NAME};
+    return 301 https://$host$request_uri;
+}
+
+# --- vhost 1: session-manager API -----------------------------------------
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name ${SM_SERVER_NAME};
+
+    ssl_certificate     ${SM_TLS_CERT_FILE};
+    ssl_certificate_key ${SM_TLS_KEY_FILE};
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 1h;
+
+    # Allow large multimodal (vision) payloads with base64-encoded images.
+    client_max_body_size 25m;
+
+    location / {
+        proxy_pass http://lsm_api;
+        proxy_http_version 1.1;
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection        "";
+
+        # Required for Server-Sent Events (the /v1/jobs/{id}/stream endpoint):
+        # stream tokens to the client immediately and never buffer/cache them.
+        proxy_buffering    off;
+        proxy_cache        off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        chunked_transfer_encoding on;
+    }
+}
+
+# --- vhost 2: raw OpenAI-compatible model server --------------------------
+# Exposes the upstream model directly (e.g. /v1/chat/completions, /v1/models).
+# This bypasses the session manager -- no job persistence, retries or reconnect.
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name ${OPENAI_SERVER_NAME};
+
+    ssl_certificate     ${OPENAI_TLS_CERT_FILE};
+    ssl_certificate_key ${OPENAI_TLS_KEY_FILE};
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 1h;
+
+    # Allow large multimodal (vision) payloads with base64-encoded images.
+    client_max_body_size 25m;
+
+    location / {
+        proxy_pass http://openai_api;
+        proxy_http_version 1.1;
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection        "";
+
+        # OpenAI-style streaming (stream:true) also uses chunked SSE responses.
+        proxy_buffering    off;
+        proxy_cache        off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        chunked_transfer_encoding on;
+    }
+}

@@ -20,6 +20,13 @@ dist/
 .coverage
 htmlcov/
 
+# Downloaded model assets (large; fetched via lsm-download)
+assets/
+
+# TLS certificates / keys (never commit real ones)
+nginx/certs/*
+!nginx/certs/.gitkeep
+
 # OS / editor
 .DS_Store
 .idea/

@@ -17,6 +17,7 @@ dependencies = [
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
     "sse-starlette>=2.1",
+    "huggingface-hub>=1.28",
 ]
 
 [project.optional-dependencies]
@@ -30,6 +31,7 @@ dev = [
 
 [project.scripts]
 lsm-api = "lsm.main:run"
+lsm-download = "lsm.cli_download:main"
 
 [build-system]
 requires = ["hatchling"]

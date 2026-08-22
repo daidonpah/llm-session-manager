@@ -87,8 +87,22 @@ All settings are environment variables prefixed with `LSM_` (see `.env.example`)
 | `LSM_RETRY_BACKOFF_BASE_S` | `2.0` | Exponential backoff base. |
 | `LSM_JOB_TTL_S` | `86400` | How long job records live in Redis. |
 | `LSM_SYNC_WAIT_TIMEOUT_S` | `300` | Max wait for a synchronous request. |
+| `LSM_ASSETS_DIR` | `assets` | Root dir for downloaded model assets (bind-mounted to `/app/assets` in Docker). |
+| `LSM_HF_CACHE_DIR` | `assets/hf-cache` | Resumable HuggingFace cache used by `lsm-download`. |
+| `LSM_MODELS_DIR` | `assets/models` | Clean, vLLM-ready model tree written by `lsm-download`. |
 | `LSM_API_PORT` | `8080` | Published host port. |
 | `LSM_BIND_HOST` | `127.0.0.1` | Host address the API port binds to. |
+| `NGINX_SM_SERVER_NAME` | `localhost` | Hostname for the session-manager vhost (must match the cert). |
+| `NGINX_OPENAI_SERVER_NAME` | `openai.localhost` | Hostname for the raw OpenAI passthrough vhost (must match the cert). |
+| `NGINX_OPENAI_UPSTREAM` | `host.docker.internal:1234` | `host:port` of the model server the OpenAI vhost proxies to. |
+| `NGINX_HTTP_PORT` | `80` | Host port nginx publishes for HTTP (redirects to HTTPS). |
+| `NGINX_HTTPS_PORT` | `443` | Host port nginx publishes for HTTPS. |
+| `NGINX_TLS_CERT_FILE` | `/etc/nginx/certs/server.crt` | Shared cert path *inside* the nginx container (mounted from `./nginx/certs`). |
+| `NGINX_TLS_KEY_FILE` | `/etc/nginx/certs/server.key` | Shared key path *inside* the nginx container (mounted from `./nginx/certs`). |
+| `NGINX_SM_TLS_CERT_FILE` | (shared) | Optional cert for the session-manager vhost; defaults to `NGINX_TLS_CERT_FILE`. |
+| `NGINX_SM_TLS_KEY_FILE` | (shared) | Optional key for the session-manager vhost; defaults to `NGINX_TLS_KEY_FILE`. |
+| `NGINX_OPENAI_TLS_CERT_FILE` | (shared) | Optional cert for the OpenAI vhost; defaults to `NGINX_TLS_CERT_FILE`. |
+| `NGINX_OPENAI_TLS_KEY_FILE` | (shared) | Optional key for the OpenAI vhost; defaults to `NGINX_TLS_KEY_FILE`. |
 
 ## Scaling
 
@@ -162,13 +176,117 @@ The SSE stream emits an `id:` (the token index) on every `token` event. On
 reconnect, pass the last id you saw as the `Last-Event-ID` header; the server
 replays only tokens after it, then tails live — no duplicates, no gaps.
 
+## Downloading models (for vLLM)
+
+Model downloading is a native part of this project — the same download core lives
+inside the app (under `LSM_MODELS_DIR`, shared with the `api`/`worker` containers
+via the `./assets` mount), so a future admin API / web UI can trigger downloads
+and show progress. For now it's driven from the command line.
+
+`lsm-download` fetches a HuggingFace repo into a clean, vLLM-ready directory
+under `LSM_MODELS_DIR` (`assets/models` by default). The printed path is exactly
+what you pass to vLLM as `--model`. A resumable HuggingFace cache is kept
+separately in `LSM_HF_CACHE_DIR` so re-runs don't re-download.
+
+```bash
+uv sync
+uv run lsm-download Qwen/Qwen2.5-7B-Instruct           # --type model (default)
+uv run lsm-download BAAI/bge-m3 --type embedding
+uv run lsm-download meta-llama/Llama-3.1-8B --token "$HF_TOKEN"   # gated repo
+```
+
+A live aggregate progress line (percent / bytes / speed) is shown while
+downloading; pass `--quiet` to suppress it.
+
+`--type` controls per-type file filtering: `model` / `embedding` / `reranker`
+pull weights but skip redundant formats (`*.pth`, `*.h5`, `*.msgpack`), while
+`tokenizer` skips weight shards entirely. Other flags: `--revision`, `--token`,
+`--allow`/`--ignore` (repeatable globs), `--force`, and `--quiet`.
+
+### Serving the result with vLLM
+
+```bash
+vllm serve ./assets/models/Qwen/Qwen2.5-7B-Instruct
+```
+
+Downloaded assets are large and git-ignored (`assets/`). The directory contains
+a `.cache/huggingface/` metadata folder used for resumable downloads; vLLM
+ignores it.
+
 ## Reverse proxy (recommended for remote access)
 
-The API binds to loopback, so to reach it from other machines terminate TLS and
-proxy to `127.0.0.1:8080` with something like nginx, Caddy or Traefik. **Streaming
-requires response buffering to be disabled.**
+The API binds to loopback, so to reach it from other machines you need a TLS
+terminating reverse proxy in front. **Streaming requires response buffering to be
+disabled** — the configs below all handle that.
 
-nginx:
+### Option A — bundled nginx service (default)
+
+The compose stack ships an `nginx` service that terminates TLS and serves **two
+name-based virtual hosts**, so you can expose both APIs on the same proxy:
+
+- **`NGINX_SM_SERVER_NAME`** (default `localhost`) → the **session-manager API**
+  (`api` container) — job persistence, retries, reconnectable streaming.
+- **`NGINX_OPENAI_SERVER_NAME`** (default `openai.localhost`) → the **raw
+  OpenAI-compatible model server** (`NGINX_OPENAI_UPSTREAM`, default the host's LM
+  Studio) — a direct passthrough with no job semantics.
+
+It publishes ports 80 (redirects to HTTPS) and 443.
+
+1. Provide the TLS cert(s) in `./nginx/certs/`. You have two options:
+
+   **One shared cert** (default) — a single SAN/wildcard cert covering both
+   hostnames, at `server.crt` / `server.key`. For a quick local test:
+
+   ```bash
+   ./nginx/generate-self-signed-cert.sh localhost openai.localhost
+   ```
+
+   **A separate cert per vhost** — pass `--separate` to emit `sm.crt/sm.key` and
+   `openai.crt/openai.key`, then point the per-vhost vars at them in `.env`:
+
+   ```bash
+   ./nginx/generate-self-signed-cert.sh --separate llm.example.com openai.example.com
+   ```
+   ```dotenv
+   NGINX_SM_TLS_CERT_FILE=/etc/nginx/certs/sm.crt
+   NGINX_SM_TLS_KEY_FILE=/etc/nginx/certs/sm.key
+   NGINX_OPENAI_TLS_CERT_FILE=/etc/nginx/certs/openai.crt
+   NGINX_OPENAI_TLS_KEY_FILE=/etc/nginx/certs/openai.key
+   ```
+
+   Each per-vhost var defaults to the shared `NGINX_TLS_CERT_FILE` /
+   `NGINX_TLS_KEY_FILE`, so leave them unset to use one cert. For production, drop
+   in your real cert(s) (e.g. Let's Encrypt `fullchain.pem` / `privkey.pem`,
+   repointed via these vars).
+
+2. Set the hostnames (must match the certificate) and, optionally, the OpenAI
+   upstream and published ports in `.env`:
+
+   ```dotenv
+   NGINX_SM_SERVER_NAME=llm.example.com
+   NGINX_OPENAI_SERVER_NAME=openai.example.com
+   NGINX_OPENAI_UPSTREAM=host.docker.internal:1234
+   NGINX_HTTP_PORT=80
+   NGINX_HTTPS_PORT=443
+   ```
+
+3. `docker compose up -d`. The proxies are live on
+   `https://<NGINX_SM_SERVER_NAME>/` and `https://<NGINX_OPENAI_SERVER_NAME>/`.
+   Both hostnames must resolve to the host (DNS, or an `/etc/hosts` entry for
+   local testing).
+
+The `./nginx/certs` directory is git-ignored, so real keys are never committed.
+
+> The raw OpenAI vhost has **no authentication and no session management**. Only
+> expose it if the upstream model server is meant to be reachable directly; put
+> auth at the proxy (see below) if it is not.
+
+### Option B — your own nginx / Caddy / Traefik
+
+Already running a proxy elsewhere? **Comment out the `nginx:` service** in
+`docker-compose.yml` and point your proxy at `127.0.0.1:8080` instead.
+`nginx/templates/lsm.conf.template` is a copy-paste starting point (replace the
+`${...}` placeholders and the upstream). A minimal nginx config:
 
 ```nginx
 server {

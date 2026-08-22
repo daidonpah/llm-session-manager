@@ -1,0 +1,4 @@
+# Place your TLS certificate and key here (git-ignored):
+#   server.crt  (fullchain certificate)
+#   server.key  (private key)
+# For local testing run: ./nginx/generate-self-signed-cert.sh
