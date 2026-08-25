@@ -18,6 +18,8 @@ dependencies = [
     "pydantic-settings>=2.3",
     "sse-starlette>=2.1",
     "huggingface-hub>=1.28",
+    "bcrypt>=4.1",
+    "python-multipart>=0.0.9",
 ]
 
 [project.optional-dependencies]
@@ -32,6 +34,7 @@ dev = [
 [project.scripts]
 lsm-api = "lsm.main:run"
 lsm-download = "lsm.cli_download:main"
+lsm-setup = "lsm.setup.app:run"
 
 [build-system]
 requires = ["hatchling"]

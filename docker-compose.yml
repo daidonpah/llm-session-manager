@@ -77,6 +77,146 @@ services:
     restart: unless-stopped
 
   # ==========================================================================
+  # First-run setup webapp (batteries-included configuration wizard on :8989).
+  # Bind-mounts the whole repo at /app so it can write .env, nginx/certs, and
+  # download models into ./assets. The built SPA ships inside the image (under
+  # src/lsm/setup/web/dist), so no Node is needed at runtime. For live UI
+  # development use the `web-dev` service (Vite HMR) via the `web-dev` profile.
+  # ==========================================================================
+  setup:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: llm-session-manager:latest
+    command: ["lsm-setup"]
+    env_file: .env
+    environment:
+      # repo_root() resolves to /app (three parents up from the package), so the
+      # wizard reads/writes the bind-mounted .env, nginx/certs and assets here.
+      LSM_REPO_ROOT: /app
+      LSM_ASSETS_DIR: /app/assets
+      LSM_HF_CACHE_DIR: /app/assets/hf-cache
+      LSM_MODELS_DIR: /app/assets/models
+    volumes:
+      # The wizard writes .env + nginx/certs and downloads into ./assets, so it
+      # needs the whole project directory, not just ./assets.
+      - .:/app
+    ports:
+      # Published on all interfaces by default: first-run setup must be reachable
+      # before any reverse proxy is configured. Restrict via LSM_SETUP_BIND_HOST.
+      - "${LSM_SETUP_BIND_HOST:-0.0.0.0}:${LSM_SETUP_PORT:-8989}:8989"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8989/api/status').status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # ==========================================================================
+  # Optional Vite dev server for the setup UI (hot module reload). Only starts
+  # with the `web-dev` profile and proxies /api to the `setup` service:
+  #   docker compose --profile web-dev up setup web-dev
+  # Edits under web/setup/ reload live at http://localhost:5173. Rebuild the
+  # committed bundle with `npm run build` in web/setup/ before committing.
+  # ==========================================================================
+  web-dev:
+    profiles: ["web-dev"]
+    image: node:22-alpine
+    working_dir: /web
+    command: ["sh", "-c", "npm install && npm run dev -- --host 0.0.0.0"]
+    environment:
+      # Proxy target for /api during development (see web/setup/vite.config.js).
+      LSM_SETUP_API: http://setup:8989
+    volumes:
+      - ./web/setup:/web
+      # Keep node_modules inside the container (don't clobber it from the host).
+      - /web/node_modules
+    ports:
+      - "${LSM_WEB_DEV_PORT:-5173}:5173"
+    depends_on:
+      - setup
+
+  # ==========================================================================
+  # Optional bundled vLLM model server, tuned for a single NVIDIA DGX Spark
+  # (GB10 / sm_121a, ARM64). Gated behind the `spark` compose profile so it is
+  # inert for everyone else:
+  #   docker compose --profile spark up -d --build
+  # Prereqs: a DGX Spark host, the NVIDIA Container Toolkit, and the model
+  # pre-downloaded with `lsm-download` (see README). vLLM serves the local dir
+  # under LSM_MODELS_DIR and advertises a stable id via --served-model-name, so
+  # point the app at it with (in .env):
+  #   LSM_MODEL_BASE_URL=http://vllm:8000/v1
+  #   LSM_DEFAULT_MODEL=${VLLM_SERVED_MODEL_NAME}
+  # Every recipe knob below is overridable via the VLLM_* env vars.
+  # ==========================================================================
+  vllm:
+    profiles: ["spark"]
+    # Community image tracking upstream vLLM for the DGX Spark (GB10/sm_121a).
+    image: ${VLLM_IMAGE:-ghcr.io/timothystewart6/vllm-gb10:latest}
+    # The image runs `vllm serve` as the passed command (not baked into the
+    # entrypoint), so the recipe is expressed here. Defaults follow the model
+    # author's single-Spark recipe for Pilcothink/Qwen3.8-27B-MixedInt4-AutoRound.
+    command:
+      - vllm
+      - serve
+      # Local, pre-downloaded model dir (mounted from ./assets). Override
+      # VLLM_MODEL_PATH to serve a different local dir or a HF repo id.
+      - ${VLLM_MODEL_PATH:-/app/assets/models/Pilcothink/Qwen3.8-27B-MixedInt4-AutoRound}
+      - --served-model-name
+      - ${VLLM_SERVED_MODEL_NAME:-qwen3.8-27b}
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8000"
+      - --tensor-parallel-size
+      - "${VLLM_TENSOR_PARALLEL_SIZE:-1}"
+      - --gpu-memory-utilization
+      - "${VLLM_GPU_MEMORY_UTILIZATION:-0.9}"
+      - --max-model-len
+      - "${VLLM_MAX_MODEL_LEN:-262144}"
+      - --max-num-batched-tokens
+      - "${VLLM_MAX_NUM_BATCHED_TOKENS:-8192}"
+      - --max-num-seqs
+      - "${VLLM_MAX_NUM_SEQS:-10}"
+      - --kv-cache-dtype
+      - "${VLLM_KV_CACHE_DTYPE:-fp8}"
+      - --reasoning-parser
+      - "${VLLM_REASONING_PARSER:-qwen3}"
+      - --tool-call-parser
+      - "${VLLM_TOOL_CALL_PARSER:-qwen3_coder}"
+      - --trust-remote-code
+      - --enable-prefix-caching
+      - --enable-auto-tool-choice
+    env_file: .env
+    # NVIDIA GPU access via the Container Toolkit (all GPUs; the Spark has one).
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: ["gpu"]
+    # vLLM needs a large shared-memory segment for its worker(s).
+    ipc: host
+    volumes:
+      # Serve the pre-downloaded models (shared with api/worker/host).
+      - ./assets:/app/assets
+      # Resumable HF cache, in case a repo id is served directly.
+      - ./assets/hf-cache:/root/.cache/huggingface
+    ports:
+      # Publish on loopback only by default (mirrors the api service). The app
+      # reaches it in-network as http://vllm:8000; expose it wider at your risk.
+      - "${VLLM_BIND_HOST:-127.0.0.1}:${VLLM_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 300s
+    restart: unless-stopped
+
+  # ==========================================================================
   # Optional bundled nginx reverse proxy (TLS termination + SSE-safe proxying).
   # Already run nginx elsewhere? Comment out this whole `nginx:` service and
   # copy nginx/templates/lsm.conf.template into your own config instead.

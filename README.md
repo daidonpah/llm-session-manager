@@ -38,7 +38,9 @@ Client ──HTTP──▶ FastAPI (API)
 ## Requirements
 
 - Docker + Docker Compose
-- An OpenAI-compatible model server reachable from the containers
+- An OpenAI-compatible model server reachable from the containers — or, on an
+  NVIDIA DGX Spark, use the bundled `spark` profile to run vLLM in-stack (see
+  [DGX Spark profile](#bundled-vllm-server--nvidia-dgx-spark-profile))
 - (For local development without Docker) Python 3.12 and [uv](https://docs.astral.sh/uv/)
 
 ## Quick start
@@ -59,6 +61,41 @@ curl http://127.0.0.1:8080/v1/health
 ```
 
 Interactive API docs are at `http://127.0.0.1:8080/docs`.
+
+## First-run setup (web wizard)
+
+Prefer not to hand-edit `.env`? The stack ships a **batteries-included setup
+webapp** that configures everything from the browser — model/app settings, the
+nginx hostnames, TLS certs (paste raw PEM), the admin account, and the first
+model download (with live progress).
+
+```bash
+# Start just the setup service (it bind-mounts the repo and writes .env for you).
+docker compose up -d --build setup
+# Open the wizard (listens on 0.0.0.0:8989 so it's reachable on first run).
+open http://localhost:8989          # or `uv run lsm-setup` without Docker
+```
+
+The wizard walks four steps: **Model & app → Reverse proxy → TLS certs → Admin →
+First model**. What it writes:
+
+- **`.env`** — merged in place, preserving your comments and ordering (only the
+  allow-listed `LSM_*` / `NGINX_*` / `VLLM_*` / `HF_TOKEN` keys can be set).
+- **`nginx/certs/`** — validated PEM cert/key pairs (keys written `0600`), either
+  one shared cert (both hostnames via SAN) or a separate cert per vhost.
+- **`assets/`** — the first model, downloaded via the same core as `lsm-download`.
+
+The final step creates the admin account. This **seals the one-time wizard**: the
+bcrypt hash is written to `.env` as `LSM_ADMIN_PASSWORD_HASH`, and from then on
+the setup webapp requires that admin login (HTTP Basic) and no longer runs the
+open wizard. After finishing, bring up the rest of the stack (`docker compose up
+-d --build`) and restrict the setup port via `LSM_SETUP_BIND_HOST` if you like.
+
+> **Developing the wizard UI?** The built SPA is committed (so the runtime image
+> needs no Node), but you can hot-reload it with the Vite dev server:
+> `docker compose --profile web-dev up setup web-dev` → edit under `web/setup/`,
+> preview at `http://localhost:5173`. Rebuild the committed bundle with
+> `npm run build` in `web/setup/` before committing UI changes.
 
 ## Security: the API binds to loopback only
 
@@ -92,8 +129,16 @@ All settings are environment variables prefixed with `LSM_` (see `.env.example`)
 | `LSM_MODELS_DIR` | `assets/models` | Clean, vLLM-ready model tree written by `lsm-download`. |
 | `LSM_API_PORT` | `8080` | Published host port. |
 | `LSM_BIND_HOST` | `127.0.0.1` | Host address the API port binds to. |
+| `LSM_SETUP_PORT` | `8989` | Published host port for the setup wizard. |
+| `LSM_SETUP_BIND_HOST` | `0.0.0.0` | Host address the setup port binds to (open on first run; restrict once configured). |
+| `LSM_ADMIN_USER` | `admin` | Admin username for the setup webapp (post-setup login). |
+| `LSM_ADMIN_PASSWORD_HASH` | (unset) | Bcrypt hash written by the wizard; its presence marks the stack "configured" and seals the wizard. Do not set by hand. |
 | `NGINX_SM_SERVER_NAME` | `localhost` | Hostname for the session-manager vhost (must match the cert). |
 | `NGINX_OPENAI_SERVER_NAME` | `openai.localhost` | Hostname for the raw OpenAI passthrough vhost (must match the cert). |
+| `VLLM_IMAGE` | `ghcr.io/timothystewart6/vllm-gb10:latest` | vLLM image for the `spark` profile (GB10/sm_121a, ARM64). |
+| `VLLM_MODEL_PATH` | `/app/assets/models/Pilcothink/Qwen3.8-27B-MixedInt4-AutoRound` | Local dir (or HF repo id) vLLM serves. |
+| `VLLM_SERVED_MODEL_NAME` | `qwen3.8-27b` | Stable model id vLLM advertises (match `LSM_DEFAULT_MODEL`). |
+| `VLLM_MAX_MODEL_LEN` | `262144` | Context window (the model supports up to `1010000`). |
 | `NGINX_OPENAI_UPSTREAM` | `host.docker.internal:1234` | `host:port` of the model server the OpenAI vhost proxies to. |
 | `NGINX_HTTP_PORT` | `80` | Host port nginx publishes for HTTP (redirects to HTTPS). |
 | `NGINX_HTTPS_PORT` | `443` | Host port nginx publishes for HTTPS. |
@@ -212,6 +257,41 @@ vllm serve ./assets/models/Qwen/Qwen2.5-7B-Instruct
 Downloaded assets are large and git-ignored (`assets/`). The directory contains
 a `.cache/huggingface/` metadata folder used for resumable downloads; vLLM
 ignores it.
+
+### Bundled vLLM server — NVIDIA DGX Spark profile
+
+For a single **NVIDIA DGX Spark** (GB10 / `sm_121a`, ARM64) there's a ready-made
+`spark` compose profile that runs vLLM alongside the API/worker, pre-tuned for
+the flagship model `Pilcothink/Qwen3.8-27B-MixedInt4-AutoRound` (a 20.8 GB
+mixed-int4 AutoRound build made to fit a single Spark).
+
+**Prerequisites:** a DGX Spark host and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
+The bundled image (`ghcr.io/timothystewart6/vllm-gb10`) is ARM64/GB10-only.
+
+```bash
+# 1. Download the model into ./assets (vLLM serves this local dir).
+uv run lsm-download Pilcothink/Qwen3.8-27B-MixedInt4-AutoRound
+
+# 2. Point the app at the in-network vllm service (edit .env, uncomment):
+#      LSM_MODEL_BASE_URL=http://vllm:8000/v1
+#      LSM_DEFAULT_MODEL=qwen3.8-27b
+
+# 3. Start the full stack including vLLM.
+docker compose --profile spark up -d --build
+```
+
+vLLM serves the local dir and advertises a stable id via
+`--served-model-name` (`VLLM_SERVED_MODEL_NAME`), so the on-disk path never
+leaks into the API. First boot is slow (the container compiles/loads the model);
+the healthcheck allows a 5-minute start period.
+
+The single-Spark recipe (tensor-parallel 1, `--gpu-memory-utilization 0.9`,
+`--kv-cache-dtype fp8`, `--enable-prefix-caching`, `qwen3` reasoning parser,
+`qwen3_coder` tool-call parser, `--trust-remote-code`, auto tool choice) is baked
+in as defaults. Every knob is overridable via the `VLLM_*` variables in `.env`
+(image, model path, served name, context length, batching, etc.). Set
+`VLLM_MODEL_PATH` to a HF repo id to have vLLM download into its own cache
+instead of serving a pre-downloaded dir.
 
 ## Reverse proxy (recommended for remote access)
 

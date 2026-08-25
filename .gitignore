@@ -4,10 +4,15 @@ __pycache__/
 *.egg-info/
 .eggs/
 build/
-dist/
+/dist/
 
 # Virtualenv / uv
 .venv/
+
+# Frontend (setup webapp). node_modules is never committed; the built SPA under
+# src/lsm/setup/web/dist IS committed so the image needs no Node at runtime.
+web/setup/node_modules/
+web/setup/dist/
 
 # Environment
 .env

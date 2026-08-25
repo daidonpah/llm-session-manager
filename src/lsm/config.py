@@ -54,10 +54,22 @@ class Settings(BaseSettings):
     hf_cache_dir: str = "assets/hf-cache"
     models_dir: str = "assets/models"
 
+    # First-run setup webapp + admin auth. The stack is considered "configured"
+    # once `admin_password_hash` is set; until then the setup wizard is open.
+    setup_host: str = "0.0.0.0"
+    setup_port: int = 8989
+    admin_user: str = "admin"
+    admin_password_hash: str = ""
+
     @property
     def model_base_url_clean(self) -> str:
         """Base URL without a trailing slash."""
         return self.model_base_url.rstrip("/")
+
+    @property
+    def is_configured(self) -> bool:
+        """True once an admin password hash has been set (setup complete)."""
+        return bool(self.admin_password_hash)
 
 
 @lru_cache
