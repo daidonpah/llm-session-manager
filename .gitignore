@@ -13,6 +13,10 @@ build/
 # src/lsm/setup/web/dist IS committed so the image needs no Node at runtime.
 web/setup/node_modules/
 web/setup/dist/
+# The `assets/` rule below (downloaded model weights) is unanchored and would
+# otherwise swallow the SPA's built bundle dir; keep the committed SPA tracked.
+!src/lsm/setup/web/dist/
+!src/lsm/setup/web/dist/assets/
 
 # Environment
 .env
@@ -25,8 +29,9 @@ web/setup/dist/
 .coverage
 htmlcov/
 
-# Downloaded model assets (large; fetched via lsm-download)
-assets/
+# Downloaded model assets (large; fetched via lsm-download). Anchored to the
+# repo root so it does not match nested dirs like the SPA's built assets/.
+/assets/
 
 # TLS certificates / keys (never commit real ones)
 nginx/certs/*
