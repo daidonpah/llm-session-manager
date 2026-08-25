@@ -21,7 +21,13 @@ from fastapi.staticfiles import StaticFiles
 from .download import router as download_router
 from .env_file import merge_env, read_env
 from .models import CertPayload, CompletePayload, ConfigPayload
-from .schema import EDITABLE_KEYS, SECRET_KEYS, env_path, write_cert
+from .schema import (
+    EDITABLE_KEYS,
+    SECRET_KEYS,
+    cert_env_updates,
+    env_path,
+    write_cert,
+)
 
 _security = HTTPBasic(auto_error=False)
 
@@ -90,7 +96,16 @@ def create_setup_app() -> FastAPI:
             crt, key = write_cert(payload.slot, payload.cert_pem, payload.key_pem)
         except ValueError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
-        return {"cert": str(crt.name), "key": str(key.name)}
+        # For a per-vhost slot, also point nginx at these files in .env so the
+        # separate cert is actually used (the shared slot needs no extra env).
+        env_updates = cert_env_updates(payload.slot)
+        if env_updates:
+            merge_env(env_path(), env_updates)
+        return {
+            "cert": str(crt.name),
+            "key": str(key.name),
+            "env_written": sorted(env_updates),
+        }
 
     @app.post("/api/complete", dependencies=[Depends(require_unconfigured)])
     def post_complete(payload: CompletePayload) -> dict:

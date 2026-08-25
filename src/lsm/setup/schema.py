@@ -55,6 +55,33 @@ CERT_SLOTS: dict[str, tuple[str, str]] = {
     "openai": ("openai.crt", "openai.key"),
 }
 
+# Where the certs live *inside the nginx container* (mounted from ./nginx/certs).
+_CERT_MOUNT = "/etc/nginx/certs"
+
+# For a per-vhost slot, the .env keys nginx reads to locate that vhost's cert.
+# The "shared" slot uses the default server.crt/server.key paths, so it needs no
+# extra env. Writing an sm/openai slot without these would leave nginx pointing
+# at the (absent) shared cert -- so the cert endpoint sets them automatically.
+_SLOT_ENV_KEYS: dict[str, tuple[str, str]] = {
+    "sm": ("NGINX_SM_TLS_CERT_FILE", "NGINX_SM_TLS_KEY_FILE"),
+    "openai": ("NGINX_OPENAI_TLS_CERT_FILE", "NGINX_OPENAI_TLS_KEY_FILE"),
+}
+
+
+def cert_env_updates(slot: str) -> dict[str, str]:
+    """Return the ``NGINX_*_TLS_*`` .env keys pointing nginx at ``slot``'s cert.
+
+    Empty for the ``shared`` slot (nginx already defaults to server.crt/key).
+    """
+    if slot not in _SLOT_ENV_KEYS:
+        return {}
+    crt_name, key_name = CERT_SLOTS[slot]
+    cert_key, key_key = _SLOT_ENV_KEYS[slot]
+    return {
+        cert_key: f"{_CERT_MOUNT}/{crt_name}",
+        key_key: f"{_CERT_MOUNT}/{key_name}",
+    }
+
 
 def repo_root() -> Path:
     """Directory that holds ``.env`` / ``nginx`` (override via ``LSM_REPO_ROOT``).

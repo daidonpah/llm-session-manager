@@ -57,6 +57,11 @@ export const api = {
 
 // Stream a model download via SSE (POST body -> EventSource isn't usable, so we
 // read the response body as a stream and parse `data:` lines ourselves).
+//
+// Parsing is deliberately tolerant: events are separated by a blank line, line
+// endings may be \n or \r\n, an event may carry multiple `data:` lines (joined
+// with newlines per the SSE spec), and the final event may arrive without a
+// trailing blank line -- so we flush whatever remains once the stream ends.
 export async function downloadModel(payload, onEvent) {
   const res = await fetch("/api/download", {
     method: "POST",
@@ -69,15 +74,35 @@ export async function downloadModel(payload, onEvent) {
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+
+  const emit = (block) => {
+    const data = block
+      .split(/\r?\n/)
+      .filter((l) => l.startsWith("data:"))
+      .map((l) => l.slice(5).replace(/^ /, "")) // strip one optional leading space
+      .join("\n");
+    if (!data) return;
+    try {
+      onEvent(JSON.parse(data));
+    } catch {
+      /* ignore keep-alive comments / partial or non-JSON frames */
+    }
+  };
+
+  const drain = () => {
+    // Normalize CRLF so a single split handles both line-ending styles.
+    const parts = buffer.replace(/\r\n/g, "\n").split("\n\n");
+    buffer = parts.pop(); // last part may be an incomplete event; keep it buffered
+    for (const block of parts) emit(block);
+  };
+
   for (;;) {
     const { value, done } = await reader.read();
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
-    const chunks = buffer.split("\n\n");
-    buffer = chunks.pop();
-    for (const chunk of chunks) {
-      const line = chunk.split("\n").find((l) => l.startsWith("data:"));
-      if (line) onEvent(JSON.parse(line.slice(5).trim()));
-    }
+    drain();
   }
+  // Flush a final event that had no trailing blank line.
+  buffer += decoder.decode();
+  if (buffer.trim()) emit(buffer);
 }

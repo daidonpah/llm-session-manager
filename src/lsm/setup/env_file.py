@@ -62,9 +62,11 @@ def merge_env(path: Path, updates: dict[str, str]) -> None:
                 lines[i] = f"{key}={_quote(remaining.pop(key))}"
 
     if remaining:
-        if lines and lines[-1].strip():
-            lines.append("")
-        lines.append("# --- Added by the setup webapp ---")
+        header = "# --- Added by the setup webapp ---"
+        if header not in lines:
+            if lines and lines[-1].strip():
+                lines.append("")
+            lines.append(header)
         for key, val in remaining.items():
             lines.append(f"{key}={_quote(val)}")
 
